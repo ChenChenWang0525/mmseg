@@ -34,3 +34,18 @@ cc = nn.Conv2d(2, 2, 13, 1, 78, 13)
 x = cc(a)
 
 print(x.shape)
+
+
+
+
+# 创建输入张量
+input_tensor = torch.randn(2, 48, 256, 256)
+
+# 定义全局平均池化层
+global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+# 进行全局平均池化
+output_tensor = global_avg_pool(input_tensor)
+
+# 输出结果
+print('输出',output_tensor.shape)  # 打印压缩后的特征图大小

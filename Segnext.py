@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import math
+import os
 import warnings
 from torch.nn.modules.utils import _pair as to_2tuple
 from mmseg.models.builder import BACKBONES
-
+import torch.nn.functional as F
 from mmcv.cnn import build_norm_layer
 from mmcv.runner import BaseModule
 from mmcv.cnn.bricks import DropPath
@@ -73,20 +74,24 @@ def get_conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation
         return DepthWiseConv2dImplicitGEMM(in_channels, kernel_size, bias=bias)
     else:
         return nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride,
-                         padding=padding, dilation=dilation, groups=groups, bias=bias)
+                         padding=padding, dilation=dilation, groups=groups, bias=bias, padding_mode="replicate")
+
 
 # --------------------------------------------大卷积核实现部分代码
 use_sync_bn = False
 
+
 def enable_sync_bn():
     global use_sync_bn
     use_sync_bn = True
+
 
 def get_bn(channels):
     if use_sync_bn:
         return nn.SyncBatchNorm(channels)
     else:
         return nn.BatchNorm2d(channels)
+
 
 def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups, dilation=1):
     if padding is None:
@@ -97,13 +102,15 @@ def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups, dil
     result.add_module('bn', get_bn(out_channels))
     return result
 
-def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups, dilation=1):
+
+def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups=1, dilation=1):
     if padding is None:
         padding = kernel_size // 2
     result = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                                         stride=stride, padding=padding, groups=groups, dilation=dilation)
+                     stride=stride, padding=padding, groups=groups, dilation=dilation)
     result.add_module('nonlinear', nn.ReLU())
     return result
+
 
 def fuse_bn(conv, bn):
     kernel = conv.weight
@@ -116,34 +123,50 @@ def fuse_bn(conv, bn):
     t = (gamma / std).reshape(-1, 1, 1, 1)
     return kernel * t, beta - running_mean * gamma / std
 
+
 class ReparamLargeKernelConv(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride, groups,
+                 dial,
                  small_kernel,
-                 small_kernel_merged=False):
+                 small_kernel_merged=False,
+                 ):
         super(ReparamLargeKernelConv, self).__init__()
         self.kernel_size = kernel_size
         self.small_kernel = small_kernel
-        # We assume the conv does not change the feature map size, so padding = k//2. Otherwise, you may configure padding as you wish, and change the padding of small_conv accordingly.
         padding = kernel_size // 2
+        if kernel_size == 7:
+            self.dial = 4
+            padding = 12
+        elif kernel_size == 9:
+            self.dial = 6
+            padding = 24
+        elif kernel_size == 13:
+            self.dial = 8
+            padding = 48
+        # We assume the conv does not change the feature map size, so padding = k//2. Otherwise, you may configure padding as you wish, and change the padding of small_conv accordingly.
+
         if small_kernel_merged:
             self.lkb_reparam = get_conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                                          stride=stride, padding=padding, dilation=1, groups=groups, bias=True)
+                                          stride=stride, padding=padding, dilation=dial, groups=groups, bias=True)
         else:
             self.lkb_origin = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                                      stride=stride, padding=padding, dilation=1, groups=groups)
+                                      stride=stride, padding=padding, dilation=dial, groups=groups)
             if small_kernel is not None:
-                assert small_kernel <= kernel_size, 'The kernel size for re-param cannot be larger than the large kernel!'
+                assert small_kernel < kernel_size, 'The kernel size for re-param cannot be larger than the large kernel!'
                 self.small_conv = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=small_kernel,
-                                             stride=stride, padding=small_kernel//2, groups=groups, dilation=1)
+                                          stride=stride, padding=small_kernel // 2, groups=groups, dilation=1)
 
     def forward(self, inputs):
         if hasattr(self, 'lkb_reparam'):
             out = self.lkb_reparam(inputs)
         else:
             out = self.lkb_origin(inputs)
+            # print("input shape===",inputs.shape)
+            # print("-------out..shape==",out.shape)
             if hasattr(self, 'small_conv'):
+                # print("-------small..shape==", self.small_conv(inputs).shape)
                 out += self.small_conv(inputs)
         return out
 
@@ -159,43 +182,68 @@ class ReparamLargeKernelConv(nn.Module):
     def merge_kernel(self):
         eq_k, eq_b = self.get_equivalent_kernel_bias()
         self.lkb_reparam = get_conv2d(in_channels=self.lkb_origin.conv.in_channels,
-                                     out_channels=self.lkb_origin.conv.out_channels,
-                                     kernel_size=self.lkb_origin.conv.kernel_size, stride=self.lkb_origin.conv.stride,
-                                     padding=self.lkb_origin.conv.padding, dilation=self.lkb_origin.conv.dilation,
-                                     groups=self.lkb_origin.conv.groups, bias=True)
+                                      out_channels=self.lkb_origin.conv.out_channels,
+                                      kernel_size=self.lkb_origin.conv.kernel_size, stride=self.lkb_origin.conv.stride,
+                                      padding=self.lkb_origin.conv.padding, dilation=self.lkb_origin.conv.dilation,
+                                      groups=self.lkb_origin.conv.groups, bias=True)
         self.lkb_reparam.weight.data = eq_k
         self.lkb_reparam.bias.data = eq_b
         self.__delattr__('lkb_origin')
         if hasattr(self, 'small_conv'):
             self.__delattr__('small_conv')
+
+
 # --------------------------------------------大卷积核实现部分代码
- def structural_reparam(self):
-        for m in self.modules():
-            if hasattr(m, 'merge_kernel'):
-                m.merge_kernel()
+def structural_reparam(self):
+    for m in self.modules():
+        if hasattr(m, 'merge_kernel'):
+            m.merge_kernel()
+
+
+def shuffle_channels(x, groups=4):
+    """shuffle channels of a 4-D Tensor"""
+    batch_size, channels, height, width = x.size()
+    assert channels % groups == 0
+    channels_per_group = channels // groups
+    # split into groups
+    x = x.view(batch_size, groups, channels_per_group,
+               height, width)
+    # transpose 1, 2 axis
+    x = x.transpose(1, 2).contiguous()
+    # reshape into orignal
+    x = x.view(batch_size, channels, height, width)
+    return x
+
 
 class AttentionModule(BaseModule):
-    def __init__(self, dim,small_kernel=5,small_kernel_merged=False):
+    def __init__(self, dim, small_kernel=3, small_kernel_merged=False, dial=2):
         super().__init__()
-        #----------这里改成  大卷积核实现   先是经过7*7卷积   然后是并行的三个3*3  9*9    21*21 的卷积
+        # ----------这里改成  大卷积核实现   先是经过7*7卷积   然后是并行的三个3*3  9*9    13*13 的卷积
+        # 先升维度  然后  通道重排  然后卷积 然后降维度
+
+        self.conv0 = conv_bn_relu(dim, dim, 1, stride=1, padding=0, groups=dim)
+
+        self.kernel_5 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
+                                               kernel_size=5,
+                                               stride=1, groups=dim, small_kernel=small_kernel,
+                                               small_kernel_merged=small_kernel_merged, dial=1)
+
+        # self.conv1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
 
         self.large_kernel_7 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
-                                                   kernel_size=7,
-                                                   stride=1, groups=dim, small_kernel=small_kernel,
-                                                   small_kernel_merged=small_kernel_merged)
+                                                     kernel_size=7,
+                                                     stride=1, groups=dim, small_kernel=3,
+                                                     small_kernel_merged=small_kernel_merged, dial=4)
 
-        self.conv1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.large_kernel_9 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
+                                                     kernel_size=9,
+                                                     stride=1, groups=dim, small_kernel=3,
+                                                     small_kernel_merged=small_kernel_merged, dial=6)
 
-        self.large_kernel_15 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
-                                                     kernel_size=15,
-                                                     stride=1, groups=dim, small_kernel=small_kernel,
-                                                     small_kernel_merged=small_kernel_merged)
-
-        self.large_kernel_23 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
-                                                     kernel_size=23,
-                                                     stride=1, groups=dim, small_kernel=small_kernel,
-                                                     small_kernel_merged=small_kernel_merged)
-
+        self.large_kernel_13 = ReparamLargeKernelConv(in_channels=dim, out_channels=dim,
+                                                      kernel_size=13,
+                                                      stride=1, groups=dim, small_kernel=3,
+                                                      small_kernel_merged=small_kernel_merged, dial=8)
         """
         self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
 
@@ -210,25 +258,42 @@ class AttentionModule(BaseModule):
         self.conv2_2 = nn.Conv2d(
             dim, dim, (21, 1), padding=(10, 0), groups=dim)
 
-        """
-        self.conv4 = nn.Conv2d(dim, dim, 1)
+
+        self.squeeze = nn.AdaptiveAvgPool2d((1, 1))
+        self.compress = nn.Conv2d(dim, dim // 16, 1, 1, 0)
+        self.excitation = nn.Conv2d(dim // 16, dim, 1, 1, 0)
+"""
+
+        self.conv4 = conv_bn_relu(dim, dim, 1, stride=1, padding=0, groups=dim)
 
     def forward(self, x):
-        u = x.clone()
+        uu = x.clone()
 
-        attn = self.large_kernel_7(x)
+        attn = self.conv0(x)
+        # attn = shuffle_channels(attn, self.groups)
+        attn_5 = self.kernel_5(attn)
 
-        attn_0 = self.conv1(attn)
+        attn_7 = self.large_kernel_7(attn)
 
-        attn_1 = self.large_kernel_7(attn)
+        attn_9 = self.large_kernel_9(attn)
 
-        attn_2 = self.large_kernel_23(attn)
+        attn_13 = self.large_kernel_13(attn)
 
-        attn = attn + attn_0 + attn_1 + attn_2
+        attn = attn_5 + attn_7 + attn_9 + attn_13
 
         attn = self.conv4(attn)
 
-        return attn * u
+        out = attn * uu
+
+        # out = torch.cat((attn_0, attn_1, attn_3), 1)
+        # out = self.squeeze(out)
+        # out = self.compress(out)
+        # out = torch.relu(out)
+        # out = self.excitation(out)
+        # out = torch.sigmoid(out)
+        # attn = self.conv4(attn)
+
+        return out + x
 
 
 class SpatialAttention(BaseModule):
@@ -289,7 +354,8 @@ class OverlapPatchEmbed(BaseModule):
     """ Image to Patch Embedding
     """
 
-    def __init__(self, patch_size=7, stride=4, in_chans=3, embed_dim=768, norm_cfg=dict(type='SyncBN', requires_grad=True)):
+    def __init__(self, patch_size=7, stride=4, in_chans=3, embed_dim=768,
+                 norm_cfg=dict(type='SyncBN', requires_grad=True)):
         super().__init__()
         patch_size = to_2tuple(patch_size)
 
@@ -307,7 +373,7 @@ class OverlapPatchEmbed(BaseModule):
         return x, H, W
 
 
-@ BACKBONES.register_module()
+@BACKBONES.register_module()
 class MSCAN(BaseModule):
     def __init__(self,
                  in_chans=3,

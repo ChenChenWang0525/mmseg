@@ -215,6 +215,27 @@ def shuffle_channels(x, groups=4):
     return x
 
 
+class channelAttention(BaseModule):
+    def __init__(self,Indim,outdim):
+        super().__init__()
+        self.globalMax = nn.MaxPool2d((1, 1))
+        self.globalAvg = nn.AvgPool2d((1, 1))
+        self.MLP = nn.Conv2d(in_channels=Indim, out_channels=outdim, kernel_size=1, stride=1, padding=0)
+        self.sig = nn.Sigmoid()
+
+    def forwad(self,x):
+        clone = x
+        outa = self.globalAvg(x)
+        outm = self.globalMax(x)
+        outa1 = self.MLP(outa)
+        outm1 = self.MLP(outm)
+        outc = outm1+outa1
+        outc1 = self.sig(outc)
+        out = clone*outc1
+        return out
+
+
+
 class AttentionModule(BaseModule):
     def __init__(self, dim, small_kernel=3, small_kernel_merged=False, dial=2):
         super().__init__()
@@ -304,6 +325,8 @@ class SpatialAttention(BaseModule):
         self.activation = nn.GELU()
         self.spatial_gating_unit = AttentionModule(d_model)
         self.proj_2 = nn.Conv2d(d_model, d_model, 1)
+        self.channel = channelAttention(d_model, d_model)
+# 新增的通道注意力模块
 
     def forward(self, x):
         shorcut = x.clone()
@@ -311,6 +334,8 @@ class SpatialAttention(BaseModule):
         x = self.activation(x)
         x = self.spatial_gating_unit(x)
         x = self.proj_2(x)
+# 新增的通道注意力机制模块
+        x = self.channel(x)
         x = x + shorcut
         return x
 
